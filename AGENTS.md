@@ -6,6 +6,17 @@
 - When changing skill discovery, verify against real `SKILL.md` files and tests. Public skills currently come from `~/.codex/skills`, `~/.agents/skills`, and `~/.codex/plugins/cache`; keep `~/.codex/skills/.system` excluded unless the user explicitly asks for system skills.
 - Do not leave watch processes running after verification.
 
+## Vendored Repositories
+
+This project keeps external reference repositories under `repos/`.
+
+- Keep `repos/` ignored by Git. Do not track external repository contents unless the user explicitly asks for a tracked subtree.
+- Do not use `git subtree` when the user asks for repository paths to be ignored; subtree-managed repositories are tracked by design.
+- Use external repositories as read-only reference material when working with related libraries.
+- Prefer examples and patterns from the vendored source code over generated guesses or web search results.
+- Do not edit files under `repos/` unless explicitly asked.
+- Do not import from `repos/`; application code should continue importing from normal package dependencies.
+
 
 
 
@@ -114,4 +125,3 @@ bun --hot ./index.ts
 ```
 
 For more information, read the Bun API docs in `node_modules/bun-types/docs/**.mdx`.
-

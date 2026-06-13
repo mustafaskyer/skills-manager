@@ -1,6 +1,9 @@
 # dependencies (bun install)
 node_modules
 
+# external reference repositories
+repos/
+
 # output
 out
 dist
