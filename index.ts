@@ -1,9 +1,27 @@
-const SKILL_FILE = "SKILL.md";
+import { resolveConfig, DEFAULT_OUTPUT_PATH } from "./src/config";
+import { collectProviderSkills } from "./src/catalog/SkillCatalog";
+import { writeSkillsFileV1, watchSkillsFile } from "./src/catalog/SkillIndexWriter";
+import {
+  codexSkillFromMarkdown,
+  codexSourceForSkill,
+  defaultCodexRoots,
+  isVisibleCodexSkill,
+} from "./src/providers/codex/CodexProvider";
+import {
+  basename,
+  dirname,
+  homeDir,
+  joinPath,
+  normalizePath,
+  type MetadataValue,
+} from "./src/path-utils";
+import { parseFrontmatter } from "./src/frontmatter";
+import { runCli } from "./src/cli/main";
+
 const RUNTIME_IS_WINDOWS =
   (Bun.env.OS ?? "").startsWith("Windows") || /^[A-Za-z]:[\\/]/.test(import.meta.dir);
 const PATH_DELIMITER = RUNTIME_IS_WINDOWS ? ";" : ":";
 
-type MetadataValue = string | boolean | MetadataValue[];
 type SkillSource = "codex" | "agents" | "plugin" | "custom" | "unknown";
 
 type SkillSourceInfo = {
@@ -12,8 +30,13 @@ type SkillSourceInfo = {
   relativePath: string;
 };
 
-type Skill = {
+type LegacySkill = {
   ref: string;
+  legacyRef?: string;
+  provider?: string;
+  providerLabel?: string;
+  sourceType?: string;
+  pluginId?: string | null;
   name: string;
   title: string;
   description: string;
@@ -25,14 +48,6 @@ type Skill = {
   path: string;
   directory: string;
   metadata: Record<string, MetadataValue>;
-};
-
-type SkillsPayload = {
-  schemaVersion: 1;
-  generatedAt: string;
-  roots: string[];
-  count: number;
-  skills: Skill[];
 };
 
 type CollectOptions = {
@@ -55,204 +70,14 @@ type ParsedArgs = {
   roots: string[];
 };
 
-function homeDir(): string {
-  return Bun.env.HOME || Bun.env.USERPROFILE || "";
-}
-
-function isAbsolutePath(filePath: string): boolean {
-  return filePath.startsWith("/") || /^[A-Za-z]:[\\/]/.test(filePath);
-}
-
-function splitPath(filePath: string): string[] {
-  return filePath.split(/[\\/]+/).filter(Boolean);
-}
-
-function normalizePath(filePath: string): string {
-  const raw = isAbsolutePath(filePath) ? filePath : `${Bun.env.PWD || import.meta.dir}/${filePath}`;
-  const drive = raw.match(/^[A-Za-z]:/)?.[0] ?? "";
-  const withoutDrive = drive ? raw.slice(drive.length) : raw;
-  const absolutePrefix = drive ? `${drive}/` : withoutDrive.startsWith("/") ? "/" : "";
-  const segments: string[] = [];
-
-  for (const segment of splitPath(withoutDrive)) {
-    if (segment === ".") continue;
-    if (segment === "..") {
-      segments.pop();
-      continue;
-    }
-    segments.push(segment);
-  }
-
-  return `${absolutePrefix}${segments.join("/")}` || absolutePrefix || ".";
-}
-
-function joinPath(...parts: string[]): string {
-  const presentParts = parts.filter(Boolean);
-  if (presentParts.length === 0) return ".";
-
-  let firstAbsoluteIndex = -1;
-  for (let index = presentParts.length - 1; index >= 0; index -= 1) {
-    if (isAbsolutePath(presentParts[index])) {
-      firstAbsoluteIndex = index;
-      break;
-    }
-  }
-
-  const relevantParts =
-    firstAbsoluteIndex === -1 ? presentParts : presentParts.slice(firstAbsoluteIndex);
-
-  return normalizePath(relevantParts.join("/"));
-}
-
-function relativePath(from: string, to: string): string {
-  const fromSegments = splitPath(normalizePath(from));
-  const toSegments = splitPath(normalizePath(to));
-  let commonLength = 0;
-
-  while (
-    commonLength < fromSegments.length &&
-    commonLength < toSegments.length &&
-    fromSegments[commonLength] === toSegments[commonLength]
-  ) {
-    commonLength += 1;
-  }
-
-  return [
-    ...Array.from({ length: fromSegments.length - commonLength }, () => ".."),
-    ...toSegments.slice(commonLength),
-  ].join("/");
-}
-
-function isRelativeInside(relative: string): boolean {
-  return relative !== "" && relative !== ".." && !relative.startsWith("../");
-}
-
-function basename(filePath: string): string {
-  return splitPath(filePath).at(-1) || "";
-}
-
-function dirname(filePath: string): string {
-  const normalized = normalizePath(filePath);
-  const segments = splitPath(normalized);
-  segments.pop();
-
-  if (normalized.startsWith("/") && segments.length === 0) return "/";
-  if (/^[A-Za-z]:[\\/]/.test(normalized) && segments.length === 1) return `${segments[0]}/`;
-
-  return `${normalized.startsWith("/") ? "/" : ""}${segments.join("/")}` || ".";
-}
-
-function hasHiddenDirectory(relativeFilePath: string): boolean {
-  const segments = relativeFilePath.split("/");
-  return segments.slice(0, -1).some((segment) => segment.startsWith("."));
-}
-
-async function rootExists(root: string): Promise<boolean> {
-  try {
-    const glob = new Bun.Glob("*");
-    for await (const _entry of glob.scan({ cwd: root, dot: true })) {
-      break;
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export const DEFAULT_OUTPUT_PATH = joinPath(homeDir(), ".skills-manager", "skills.json");
+export { DEFAULT_OUTPUT_PATH, parseFrontmatter };
 
 export function defaultRoots(baseHomeDir = homeDir()): string[] {
-  return [
-    joinPath(baseHomeDir, ".codex", "skills"),
-    joinPath(baseHomeDir, ".agents", "skills"),
-    joinPath(baseHomeDir, ".codex", "plugins", "cache"),
-  ];
+  return defaultCodexRoots(baseHomeDir);
 }
 
 export function isPublicSkillFile(filePath: string, baseHomeDir = homeDir()): boolean {
-  const normalized = normalizePath(filePath);
-  const relativeToCodexSkills = relativePath(
-    joinPath(baseHomeDir, ".codex", "skills"),
-    normalized,
-  );
-
-  if (isRelativeInside(relativeToCodexSkills)) {
-    const [firstSegment] = relativeToCodexSkills.split("/");
-    return firstSegment !== ".system";
-  }
-
-  return true;
-}
-
-function parseScalar(value: string): MetadataValue {
-  const trimmed = value.trim();
-
-  if (
-    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-  ) {
-    return trimmed.slice(1, -1);
-  }
-
-  if (trimmed === "true") return true;
-  if (trimmed === "false") return false;
-
-  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-    return trimmed
-      .slice(1, -1)
-      .split(",")
-      .map((item) => parseScalar(item))
-      .filter((item) => item !== "");
-  }
-
-  return trimmed;
-}
-
-export function parseFrontmatter(markdown: string): {
-  data: Record<string, MetadataValue>;
-  body: string;
-} {
-  if (!markdown.startsWith("---\n")) {
-    return { data: {}, body: markdown };
-  }
-
-  const endIndex = markdown.indexOf("\n---", 4);
-  if (endIndex === -1) {
-    return { data: {}, body: markdown };
-  }
-
-  const rawFrontmatter = markdown.slice(4, endIndex);
-  const body = markdown.slice(endIndex).replace(/^\n---\r?\n?/, "");
-  const data: Record<string, MetadataValue> = {};
-
-  for (const line of rawFrontmatter.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-
-    const separatorIndex = trimmed.indexOf(":");
-    if (separatorIndex === -1) continue;
-
-    const key = trimmed.slice(0, separatorIndex).trim();
-    const value = trimmed.slice(separatorIndex + 1);
-    data[key] = parseScalar(value);
-  }
-
-  return { data, body };
-}
-
-function firstHeading(markdown: string): string {
-  const match = markdown.match(/^#\s+(.+)$/m);
-  return match ? match[1].trim() : "";
-}
-
-function firstParagraph(markdown: string): string {
-  const withoutHeadings = markdown
-    .split(/\r?\n/)
-    .filter((line) => !line.trim().startsWith("#"))
-    .join("\n");
-
-  const match = withoutHeadings.match(/(?:^|\n)([^\n`>-][^\n]+(?:\n[^\n`>-][^\n]+)*)/);
-  return match ? match[1].replace(/\s+/g, " ").trim() : "";
+  return isVisibleCodexSkill(filePath, baseHomeDir);
 }
 
 export function sourceForSkill(
@@ -260,53 +85,24 @@ export function sourceForSkill(
   roots: string[],
   baseHomeDir = homeDir(),
 ): SkillSourceInfo {
-  const normalized = normalizePath(skillFile);
-  const matchingRoot = roots.map(normalizePath).find((root) => {
-    const relative = relativePath(root, normalized);
-    return isRelativeInside(relative);
-  });
-
-  if (!matchingRoot) {
-    return {
-      kind: "unknown",
-      root: null,
-      relativePath: basename(skillFile),
-    };
-  }
-
-  const skillRelativePath = relativePath(matchingRoot, normalized);
-  const codexSkillsRoot = joinPath(baseHomeDir, ".codex", "skills");
-  const agentsSkillsRoot = joinPath(baseHomeDir, ".agents", "skills");
-  const pluginCacheRoot = joinPath(baseHomeDir, ".codex", "plugins", "cache");
-
-  if (matchingRoot === normalizePath(codexSkillsRoot)) {
-    return { kind: "codex", root: matchingRoot, relativePath: skillRelativePath };
-  }
-
-  if (matchingRoot === normalizePath(agentsSkillsRoot)) {
-    return { kind: "agents", root: matchingRoot, relativePath: skillRelativePath };
-  }
-
-  if (matchingRoot === normalizePath(pluginCacheRoot)) {
-    return { kind: "plugin", root: matchingRoot, relativePath: skillRelativePath };
-  }
-
-  return { kind: "custom", root: matchingRoot, relativePath: skillRelativePath };
+  const source = codexSourceForSkill(skillFile, roots, baseHomeDir);
+  return {
+    kind: source.sourceType as SkillSource,
+    root: source.sourceRoot,
+    relativePath: source.relativePath,
+  };
 }
 
 export function buildRef(skillFile: string, roots: string[], baseHomeDir = homeDir()): string {
-  const source = sourceForSkill(skillFile, roots, baseHomeDir);
+  const source = codexSourceForSkill(skillFile, roots, baseHomeDir);
   const segments = source.relativePath.split("/");
   const skillName = segments.at(-2) || basename(dirname(skillFile));
 
-  if (source.kind === "plugin") {
-    const skillsIndex = segments.lastIndexOf("skills");
-    const pluginId =
-      skillsIndex > 0 ? segments.slice(0, skillsIndex).join("/") : segments.slice(0, -2).join("/");
-    return `plugin:${pluginId}:${skillName}`;
+  if (source.sourceType === "plugin" && source.pluginId) {
+    return `plugin:${source.pluginId}:${skillName}`;
   }
 
-  return `${source.kind}:${skillName}`;
+  return `${source.sourceType}:${skillName}`;
 }
 
 export function skillFromMarkdown(
@@ -314,97 +110,71 @@ export function skillFromMarkdown(
   markdown: string,
   roots: string[],
   baseHomeDir = homeDir(),
-): Skill {
-  const { data, body } = parseFrontmatter(markdown);
-  const source = sourceForSkill(skillFile, roots, baseHomeDir);
-  const skillDirectory = dirname(skillFile);
-  const fallbackName = basename(skillDirectory);
-  const name = typeof data.name === "string" && data.name ? data.name : fallbackName;
-  const title = firstHeading(body) || name;
-  const description =
-    typeof data.description === "string" && data.description
-      ? data.description
-      : firstParagraph(body);
+): LegacySkill {
+  const source = codexSourceForSkill(skillFile, roots, baseHomeDir);
+  const normalizedPath = normalizePath(skillFile);
+  const skill = codexSkillFromMarkdown(
+    {
+      provider: "codex",
+      sourceRoot: source.sourceRoot,
+      relativePath: source.relativePath,
+      path: normalizedPath,
+      directory: dirname(normalizedPath),
+      sourceType: source.sourceType,
+      pluginId: source.pluginId,
+    },
+    markdown,
+  );
 
   return {
-    ref: buildRef(skillFile, roots, baseHomeDir),
-    name,
-    title,
-    description,
-    version: data.version || null,
-    allowedTools: data["allowed-tools"] || null,
-    source: source.kind,
-    sourceRoot: source.root,
-    relativePath: source.relativePath,
-    path: normalizePath(skillFile),
-    directory: normalizePath(skillDirectory),
-    metadata: data,
+    ...skill,
+    ref: skill.legacyRef,
+    legacyRef: skill.legacyRef,
+    provider: skill.provider,
+    providerLabel: skill.providerLabel,
+    sourceType: skill.sourceType,
+    pluginId: skill.pluginId,
+    source: skill.sourceType as SkillSource,
   };
 }
 
 export async function findSkillFiles(root: string, baseHomeDir = homeDir()): Promise<string[]> {
-  const files: string[] = [];
-  const glob = new Bun.Glob(`**/${SKILL_FILE}`);
-
-  try {
-    for await (const skillFile of glob.scan({ cwd: root, absolute: true, dot: true })) {
-      const relativeSkillPath = relativePath(root, skillFile);
-
-      if (hasHiddenDirectory(relativeSkillPath) || !isPublicSkillFile(skillFile, baseHomeDir)) {
-        continue;
-      }
-
-      files.push(skillFile);
-    }
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return [];
-    }
-    throw error;
-  }
-
-  return files;
+  const snapshot = await collectProviderSkills({
+    homeDir: baseHomeDir,
+    providers: ["codex"],
+    rootsByProvider: { codex: [root] },
+  });
+  return snapshot.skills.map((skill) => skill.path);
 }
 
 export async function collectSkills({
   roots = defaultRoots(),
   homeDir: baseHomeDir = homeDir(),
-}: CollectOptions = {}): Promise<Skill[]> {
-  const uniqueFiles = new Set<string>();
+}: CollectOptions = {}): Promise<LegacySkill[]> {
+  const snapshot = await collectProviderSkills({
+    homeDir: baseHomeDir,
+    providers: ["codex"],
+    rootsByProvider: { codex: roots },
+  });
 
-  for (const root of roots) {
-    for (const skillFile of await findSkillFiles(root, baseHomeDir)) {
-      uniqueFiles.add(normalizePath(skillFile));
-    }
-  }
-
-  const skills: Skill[] = [];
-
-  for (const skillFile of [...uniqueFiles].sort()) {
-    const markdown = await Bun.file(skillFile).text();
-    skills.push(skillFromMarkdown(skillFile, markdown, roots, baseHomeDir));
-  }
-
-  return skills.sort((left, right) => left.ref.localeCompare(right.ref));
+  return snapshot.skills.map((skill) => ({
+    ...skill,
+    ref: skill.legacyRef,
+    source: skill.sourceType as SkillSource,
+  }));
 }
 
 export async function writeSkillsFile({
   outputPath = DEFAULT_OUTPUT_PATH,
   roots = defaultRoots(),
   homeDir: baseHomeDir = homeDir(),
-}: WriteOptions = {}): Promise<SkillsPayload> {
-  const skills = await collectSkills({ roots, homeDir: baseHomeDir });
-  const payload: SkillsPayload = {
-    schemaVersion: 1,
-    generatedAt: new Date().toISOString(),
-    roots: roots.map(normalizePath),
-    count: skills.length,
-    skills,
-  };
-
-  await Bun.write(outputPath, `${JSON.stringify(payload, null, 2)}\n`);
-
-  return payload;
+}: WriteOptions = {}) {
+  return writeSkillsFileV1({
+    outputPath,
+    homeDir: baseHomeDir,
+    providers: ["codex"],
+    rootsByProvider: { codex: roots },
+  });
 }
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -449,6 +219,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
 export function usage(): string {
   return `Usage:
   bun run index.ts [--watch] [--output <path>] [--root <path>]
+  skillsmanager dev [--provider codex] [--root <path>] [--host 127.0.0.1] [--port 3737]
 
 Options:
   -w, --watch        Watch skill roots and rewrite the JSON on SKILL.md changes.
@@ -457,96 +228,66 @@ Options:
   -h, --help         Print this help text.
 
 Environment:
-  SKILLS_MANAGER_OUTPUT  Override the output path.
-  SKILLS_MANAGER_ROOTS   Replace default roots, separated by the OS path delimiter.
+  SKILLS_MANAGER_OUTPUT     Override the output path.
+  SKILLS_MANAGER_ROOTS      Replace default roots, separated by the OS path delimiter.
+  SKILLS_MANAGER_PROVIDERS  Enabled providers, separated by the OS path delimiter.
 `;
-}
-
-async function skillsSnapshot(roots: string[], baseHomeDir: string): Promise<string> {
-  const entries: string[] = [];
-
-  for (const root of roots) {
-    for (const skillFile of await findSkillFiles(root, baseHomeDir)) {
-      try {
-        const stats = await Bun.file(skillFile).stat();
-        entries.push(`${normalizePath(skillFile)}:${stats.size}:${stats.mtimeMs}`);
-      } catch {
-        entries.push(`${normalizePath(skillFile)}:missing`);
-      }
-    }
-  }
-
-  return entries.sort().join("\n");
 }
 
 export async function watchSkills({
   outputPath = DEFAULT_OUTPUT_PATH,
   roots = defaultRoots(),
   homeDir: baseHomeDir = homeDir(),
-  intervalMs = 1000,
+  intervalMs = 250,
 }: WatchOptions = {}): Promise<() => void> {
-  const existingRoots: string[] = [];
-
-  for (const root of roots) {
-    if (await rootExists(root)) {
-      existingRoots.push(root);
-    }
-  }
-
-  if (existingRoots.length === 0) {
-    throw new Error(`No skill roots found: ${roots.join(", ")}`);
-  }
-
-  let stopped = false;
-  let currentSnapshot = await skillsSnapshot(roots, baseHomeDir);
-
-  const sync = async () => {
-    const payload = await writeSkillsFile({ outputPath, roots, homeDir: baseHomeDir });
-    console.log(`Recorded ${payload.count} skills in ${outputPath}`);
-  };
-
-  await sync();
-
-  const watchLoop = async () => {
-    while (!stopped) {
-      await Bun.sleep(intervalMs);
-      if (stopped) break;
-
-      try {
-        const nextSnapshot = await skillsSnapshot(roots, baseHomeDir);
-        if (nextSnapshot === currentSnapshot) continue;
-
-        currentSnapshot = nextSnapshot;
-        await sync();
-      } catch (error) {
-        console.error(error);
-      }
-    }
-  };
-
-  void watchLoop();
-  console.log(`Watching ${existingRoots.length} skill roots. Press Ctrl+C to stop.`);
-
-  return () => {
-    stopped = true;
-  };
+  return watchSkillsFile({
+    outputPath,
+    homeDir: baseHomeDir,
+    providers: ["codex"],
+    rootsByProvider: { codex: roots },
+    intervalMs,
+  });
 }
 
 async function main(): Promise<void> {
-  const args = parseArgs(Bun.argv.slice(2));
+  const argv = Bun.argv.slice(2);
+  const [command] = argv;
+
+  if (command === "dev" || command === "sync" || command === "watch") {
+    await import("./src/cli/main").then(({ main }) => main());
+    return;
+  }
+
+  const args = parseArgs(argv);
 
   if (args.help) {
     console.log(usage());
     return;
   }
 
+  const config = await resolveConfig({
+    providers: ["codex"],
+    roots: args.roots,
+    outputPath: args.outputPath,
+  });
+
   if (args.watch) {
-    await watchSkills(args);
+    await watchSkills({
+      outputPath: config.outputPath,
+      roots: config.rootsByProvider.codex,
+      homeDir: config.homeDir,
+    });
     return;
   }
 
-  const payload = await writeSkillsFile(args);
-  console.log(`Recorded ${payload.count} skills in ${args.outputPath}`);
+  const payload = await writeSkillsFile({
+    outputPath: config.outputPath,
+    roots: config.rootsByProvider.codex,
+    homeDir: config.homeDir,
+  });
+  console.log(`Recorded ${payload.count} skills in ${config.outputPath}`);
 }
 
 if (import.meta.main) await main();
+
+export { runCli };
