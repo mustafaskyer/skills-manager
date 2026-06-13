@@ -12,9 +12,11 @@
 - For utility dashboards, avoid decorative generated-UI styling such as repeated sparkle glyphs, radial/grid backgrounds, oversized showcase cards, and heavy tinted shadows. Prefer dense, task-oriented shadcn-style patterns: neutral tokens, crisp borders, compact controls, readable rows, and clear workspace hierarchy.
 - Keep long catalog pagination discoverable. When result lists extend past the first viewport, prefer a bottom sticky pagination rail with the result list scrolling above it, and verify it stays visible without covering row content.
 - Keep catalog row metadata and actions in one scoped right-side column. Do not reuse detail-page grid-area styles for repeated row fields, because they can pull paths, badges, and arrows out of alignment.
+- Catalog filters only affect the catalog list. When the dashboard is on a skill detail route, keep sidebar filter controls disabled and verify they are no longer exposed as clickable controls in browser snapshots.
 - If the global `agent-browser` shim points at a missing pnpm package, use `npm exec --yes agent-browser -- <command>` for UI verification instead of abandoning browser checks.
 - Do not leave watch processes running after verification.
 - When updating README/product docs, verify app capabilities from source code and screenshots first. Clearly separate implemented behavior from roadmap-level management actions such as add, remove, enable, and disable.
+- When adding README screenshots for a feature, verify the image file exists and place it near the matching feature narrative so future doc edits do not describe an unverified UI state.
 
 ## Vendored Repositories
 

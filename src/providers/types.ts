@@ -1,6 +1,6 @@
 import type { Effect } from "effect";
 
-import type { NormalizedSkill, SkillParseError, SkillWarning } from "../domain";
+import type { NormalizedSkill, SkillParseError, SkillUninstallResult, SkillWarning } from "../domain";
 
 export type ProviderContext = {
   homeDir: string;
@@ -32,4 +32,8 @@ export type SkillProvider = {
     entry: ProviderSkillEntry,
     context: ProviderContext,
   ) => Effect.Effect<NormalizedSkill, SkillParseError>;
+  uninstall?: (
+    skill: NormalizedSkill,
+    context: ProviderContext,
+  ) => Effect.Effect<SkillUninstallResult>;
 };

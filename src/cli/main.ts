@@ -1,10 +1,12 @@
 import { BunRuntime, BunServices } from "@effect/platform-bun";
 import { Console, Effect } from "effect";
-import { Command, Flag } from "effect/unstable/cli";
+import { Argument, Command, Flag } from "effect/unstable/cli";
 
+import { collectProviderSkills, findSkillByRef } from "../catalog/SkillCatalog";
 import { resolveConfig } from "../config";
 import { writeSkillsFileV1, watchSkillsFile } from "../catalog/SkillIndexWriter";
 import { dashboardServerResource } from "../server/DashboardServer";
+import { getDefaultProvider } from "../providers/registry";
 
 const packageJson = await Bun.file(new URL("../../package.json", import.meta.url)).json();
 
@@ -35,12 +37,85 @@ const portFlag = Flag.integer("port").pipe(
   Flag.withDefault(3737),
 );
 
+const yesFlag = Flag.boolean("yes").pipe(
+  Flag.withDescription("Skip confirmation prompts."),
+  Flag.withDefault(false),
+);
+
+const skillArgument = Argument.string("skill").pipe(
+  Argument.withDescription("Skill ref, legacy ref, or exact skill name to uninstall."),
+);
+
 function normalizeList(values: readonly string[]): string[] | undefined {
   return values.length > 0 ? [...values] : undefined;
 }
 
 function normalizeOutput(value: string): string | undefined {
   return value ? value : undefined;
+}
+
+async function confirmUninstall(message: string): Promise<boolean> {
+  const answer = globalThis.prompt?.(`${message}\nType "yes" to confirm:`) ?? "";
+  return answer.trim().toLowerCase() === "yes";
+}
+
+async function uninstallSkillBySelector(options: {
+  providers?: readonly string[];
+  roots?: readonly string[];
+  selector: string;
+  yes: boolean;
+}) {
+  const config = await resolveConfig({
+    providers: normalizeList(options.providers ?? []),
+    roots: normalizeList(options.roots ?? []),
+  });
+  const snapshot = await collectProviderSkills(config);
+  const byRef = findSkillByRef(snapshot, options.selector);
+  const matchingByName = snapshot.skills.filter((skill) => skill.name === options.selector);
+  const skill = byRef ?? (matchingByName.length === 1 ? matchingByName[0] : undefined);
+
+  if (!skill) {
+    if (matchingByName.length > 1) {
+      throw new Error(
+        `Ambiguous skill name "${options.selector}". Use one of: ${
+          matchingByName.map((candidate) => candidate.ref).join(", ")
+        }`,
+      );
+    }
+    throw new Error(`Skill not found: ${options.selector}`);
+  }
+
+  const provider = getDefaultProvider(skill.provider);
+  if (!provider?.uninstall) {
+    throw new Error(`Provider does not support uninstall: ${skill.provider}`);
+  }
+
+  if (!options.yes) {
+    const confirmed = await confirmUninstall(
+      `Uninstall ${skill.name} from ${skill.directory}?`,
+    );
+    if (!confirmed) {
+      console.log("Uninstall cancelled.");
+      return;
+    }
+  }
+
+  const result = await Effect.runPromise(provider.uninstall(skill, {
+    homeDir: config.homeDir,
+    roots: config.rootsByProvider[skill.provider],
+  }));
+
+  if (result.warnings.length > 0) {
+    throw new Error(result.warnings[0].message);
+  }
+
+  console.log(`Removed ${skill.ref}`);
+  for (const path of result.removedPaths) {
+    console.log(`- ${path}`);
+  }
+  if (result.lockUpdated) {
+    console.log("Updated ~/.agents/.skill-lock.json");
+  }
 }
 
 const root = Command.make("skillsmanager").pipe(
@@ -125,7 +200,26 @@ const dev = Command.make(
     })),
 ).pipe(Command.withDescription("Start the local dashboard server."));
 
-export const skillsManagerCommand = root.pipe(Command.withSubcommands([dev, sync, watch]));
+const uninstall = Command.make(
+  "uninstall",
+  {
+    provider: providerFlag,
+    root: rootFlag,
+    skill: skillArgument,
+    yes: yesFlag,
+  },
+  ({ provider, root, skill, yes }) =>
+    Effect.promise(() =>
+      uninstallSkillBySelector({
+        providers: provider,
+        roots: root,
+        selector: skill,
+        yes,
+      })
+    ),
+).pipe(Command.withDescription("Uninstall a user skill by ref, legacy ref, or exact name."));
+
+export const skillsManagerCommand = root.pipe(Command.withSubcommands([dev, sync, watch, uninstall]));
 
 export const runCli = (args?: readonly string[]) => {
   const program = args

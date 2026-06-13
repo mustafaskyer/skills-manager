@@ -6,12 +6,14 @@ import { parseFrontmatter } from "../frontmatter";
 import {
   SKILL_FILE,
   basename,
+  homeDir as defaultHomeDir,
   isAbsolutePath,
   isRelativeInside,
   joinPath,
   relativePath,
   splitPath,
 } from "../path-utils";
+import { getDefaultProvider } from "../providers/registry";
 
 export type DashboardServerOptions = CatalogOptions & {
   host?: string;
@@ -128,6 +130,17 @@ function notFound(message: string, ref = ""): Response {
   );
 }
 
+async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
+  try {
+    const body = await request.text();
+    if (!body.trim()) return {};
+    const parsed = JSON.parse(body);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
 async function buildStylesheet(): Promise<string> {
   const input = joinPath(import.meta.dir, "..", "ui", "styles.css");
   const bunExecutable = Bun.argv[0] ?? "bun";
@@ -207,7 +220,11 @@ async function readUiAsset(pathname: string): Promise<Response> {
   return new Response(file, { headers: { "content-type": contentType } });
 }
 
-async function handleApi(url: URL, options: Required<Pick<DashboardServerOptions, "host" | "port">> & CatalogOptions) {
+async function handleApi(
+  request: Request,
+  url: URL,
+  options: Required<Pick<DashboardServerOptions, "host" | "port">> & CatalogOptions,
+) {
   const snapshot = await collectProviderSkills(options);
 
   if (url.pathname === "/api/health" || url.pathname === "/api/v1/health") {
@@ -346,6 +363,60 @@ async function handleApi(url: URL, options: Required<Pick<DashboardServerOptions
     });
   }
 
+  const uninstallMatch = url.pathname.match(/^\/api\/v1\/skills\/(.+)\/uninstall$/);
+
+  if (uninstallMatch?.[1]) {
+    if (request.method !== "POST") {
+      return jsonResponse({ apiVersion: 1, warnings: [] }, { status: 405 });
+    }
+
+    const ref = decodeURIComponent(uninstallMatch[1]);
+    const skill = findSkillByRef(snapshot, ref);
+    if (!skill) {
+      return notFound("Skill ref is not in the current catalog.", ref);
+    }
+
+    const body = await readJsonBody(request);
+    if (body.confirmRef !== skill.ref) {
+      return jsonResponse(
+        {
+          apiVersion: 1,
+          warnings: [{
+            code: "SkillUninstallError",
+            provider: skill.provider,
+            ref: skill.ref,
+            path: skill.directory,
+            message: "Confirmation ref must match the provider-aware skill ref.",
+          }],
+        },
+        { status: 400 },
+      );
+    }
+
+    const provider = getDefaultProvider(skill.provider);
+    if (!provider?.uninstall) {
+      return jsonResponse(
+        {
+          apiVersion: 1,
+          warnings: [{
+            code: "SkillUninstallError",
+            provider: skill.provider,
+            ref: skill.ref,
+            path: skill.directory,
+            message: `Provider does not support uninstall: ${skill.provider}`,
+          }],
+        },
+        { status: 400 },
+      );
+    }
+
+    const result = await Effect.runPromise(provider.uninstall(skill, {
+      homeDir: options.homeDir ?? defaultHomeDir(),
+      roots: options.rootsByProvider?.[skill.provider],
+    }));
+    return jsonResponse(result, { status: result.warnings.length > 0 ? 400 : 200 });
+  }
+
   const previewPrefix = url.pathname.startsWith("/api/v1/skills/")
     ? "/api/v1/skills/"
     : url.pathname.startsWith("/api/skills/")
@@ -397,7 +468,7 @@ export async function startDashboardServer(options: DashboardServerOptions = {})
         const url = new URL(request.url);
 
         if (url.pathname.startsWith("/api/")) {
-          const response = await handleApi(url, normalizedOptions);
+          const response = await handleApi(request, url, normalizedOptions);
           return response ?? jsonResponse({ apiVersion: 1, warnings: [] }, { status: 404 });
         }
 
