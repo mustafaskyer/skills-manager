@@ -220,6 +220,7 @@ export function usage(): string {
   return `Usage:
   bun run index.ts [--watch] [--output <path>] [--root <path>]
   skillsmanager dev [--provider codex] [--root <path>] [--host 127.0.0.1] [--port 3737]
+  skillsmanager uninstall <skill> [--provider codex] [--root <path>] [--yes]
 
 Options:
   -w, --watch        Watch skill roots and rewrite the JSON on SKILL.md changes.
@@ -253,7 +254,7 @@ async function main(): Promise<void> {
   const argv = Bun.argv.slice(2);
   const [command] = argv;
 
-  if (command === "dev" || command === "sync" || command === "watch") {
+  if (command === "dev" || command === "sync" || command === "watch" || command === "uninstall") {
     await import("./src/cli/main").then(({ main }) => main());
     return;
   }

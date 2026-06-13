@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 
 import { collectProviderSkills } from "../../catalog/SkillCatalog";
-import { defaultCodexRoots } from "./CodexProvider";
+import { defaultCodexRoots, uninstallCodexSkill } from "./CodexProvider";
 
 let tempDir: string;
 
@@ -152,4 +152,38 @@ description: Duplicate name.
     ref: "codex:codex:same",
     message: "Duplicate skill ref skipped: codex:codex:same",
   });
+});
+
+test("codex uninstall rejects unsafe root targets", async () => {
+  const homeDir = joinPath(tempDir, "home");
+  const root = joinPath(homeDir, ".agents", "skills");
+  await writeSkill(joinPath(root, "SKILL.md"), "# Invalid Root Skill");
+
+  const result = await uninstallCodexSkill(
+    {
+      ref: "codex:custom:skills",
+      legacyRef: "custom:skills",
+      provider: "codex",
+      providerLabel: "Codex",
+      sourceType: "custom",
+      name: "skills",
+      title: "Skills",
+      description: "",
+      version: null,
+      allowedTools: null,
+      sourceRoot: root,
+      pluginId: null,
+      relativePath: "SKILL.md",
+      path: joinPath(root, "SKILL.md"),
+      directory: root,
+      metadata: {},
+    },
+    { homeDir, roots: [root] },
+  );
+
+  expect(result.warnings[0]).toMatchObject({
+    code: "SkillUninstallError",
+    message: "Skill directory is not inside an enabled source root.",
+  });
+  expect(await Bun.file(joinPath(root, "SKILL.md")).exists()).toBe(true);
 });

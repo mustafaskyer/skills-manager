@@ -10,9 +10,13 @@ import {
   FileText,
   FolderClosed,
   Layers,
+  Loader2,
   Package,
   RefreshCw,
   Search,
+  ShieldAlert,
+  Trash2,
+  X,
 } from "lucide-react";
 import { Streamdown } from "streamdown";
 import { cjk } from "@streamdown/cjk";
@@ -81,16 +85,39 @@ type SkillFilePayload = {
   warnings: SkillWarning[];
 };
 
+type SkillUninstallStep = {
+  name: SkillUninstallStepName;
+  status: "pending" | "running" | "completed" | "failed";
+  message: string;
+};
+
+type SkillUninstallPayload = {
+  apiVersion: 1;
+  skill: Skill;
+  steps: SkillUninstallStep[];
+  removedPaths: string[];
+  lockUpdated: boolean;
+  warnings: SkillWarning[];
+};
+
 type Route =
   | { name: "catalog" }
-  | { name: "skill"; ref: string };
+  | { name: "skill"; ref: string }
+  | { name: "uninstall"; ref: string };
 
 const PAGE_SIZE = 16;
+const UNINSTALL_STEP_DELAY_MS = 650;
+const UNINSTALL_STEP_NAMES = ["locating repo", "removing", "checking", "removed"] as const;
+
+type SkillUninstallStepName = typeof UNINSTALL_STEP_NAMES[number];
 
 function routeFromLocation(): Route {
   const prefix = "/skills/";
   if (window.location.pathname.startsWith(prefix)) {
     const encodedRef = window.location.pathname.slice(prefix.length);
+    if (encodedRef.endsWith("/uninstall")) {
+      return { name: "uninstall", ref: decodeURIComponent(encodedRef.slice(0, -"/uninstall".length)) };
+    }
     if (encodedRef) return { name: "skill", ref: decodeURIComponent(encodedRef) };
   }
 
@@ -99,6 +126,10 @@ function routeFromLocation(): Route {
 
 function skillRoute(ref: string): string {
   return `/skills/${encodeURIComponent(ref)}`;
+}
+
+function uninstallRoute(ref: string): string {
+  return `${skillRoute(ref)}/uninstall`;
 }
 
 function unique(values: Array<string | null | undefined>): string[] {
@@ -208,16 +239,24 @@ function SkillRow({ skill, onOpen }: { skill: Skill; onOpen: (skill: Skill) => v
 function FilterButton({
   active,
   count,
+  disabled = false,
   label,
   onClick,
 }: {
   active: boolean;
   count: number;
+  disabled?: boolean;
   label: string;
   onClick: () => void;
 }) {
   return (
-    <button type="button" className={`sidebar-filter ${active ? "active" : ""}`} onClick={onClick}>
+    <button
+      type="button"
+      className={`sidebar-filter ${active ? "active" : ""}`}
+      disabled={disabled}
+      title={disabled ? "Filters are available in catalog view" : undefined}
+      onClick={onClick}
+    >
       <span>{label}</span>
       <small>{count}</small>
     </button>
@@ -344,6 +383,183 @@ function FileTree({
   );
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function uninstallStepsAt(activeIndex: number, failedIndex: number | null = null): SkillUninstallStep[] {
+  return UNINSTALL_STEP_NAMES.map((name, index) => ({
+    name,
+    status: failedIndex === index
+      ? "failed"
+      : index < activeIndex
+        ? "completed"
+        : index === activeIndex
+          ? "running"
+          : "pending",
+    message: name,
+  }));
+}
+
+function initialUninstallSteps(): SkillUninstallStep[] {
+  return uninstallStepsAt(0);
+}
+
+async function playUninstallProgress(setSteps: React.Dispatch<React.SetStateAction<SkillUninstallStep[]>>) {
+  for (let index = 0; index < UNINSTALL_STEP_NAMES.length; index += 1) {
+    setSteps(uninstallStepsAt(index));
+    await delay(UNINSTALL_STEP_DELAY_MS);
+  }
+
+  setSteps(uninstallStepsAt(UNINSTALL_STEP_NAMES.length));
+}
+
+function UninstallDialog({
+  mode,
+  skill,
+  onCancel,
+  onConfirm,
+}: {
+  mode: "confirm" | "blocked";
+  skill: Skill;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const blocked = mode === "blocked";
+
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-zinc-950/40 px-4" role="presentation">
+      <section
+        aria-modal="true"
+        role="dialog"
+        aria-labelledby="uninstall-dialog-title"
+        className="w-full max-w-[560px] rounded-lg border border-zinc-200 bg-white shadow-xl"
+      >
+        <header className="flex items-start justify-between gap-4 border-b border-zinc-200 px-5 py-4">
+          <div className="min-w-0">
+            <p className="mb-1 text-xs font-semibold uppercase tracking-normal text-zinc-500">
+              {blocked ? "Managed source" : "Uninstall skill"}
+            </p>
+            <h3 id="uninstall-dialog-title" className="m-0 text-base font-semibold leading-6 text-zinc-950">
+              {skill.title}
+            </h3>
+          </div>
+          <button
+            type="button"
+            className="grid h-8 w-8 place-items-center rounded-md border border-zinc-200 bg-white text-zinc-600 hover:bg-zinc-50"
+            onClick={onCancel}
+            aria-label="Close"
+          >
+            <X size={15} />
+          </button>
+        </header>
+        <div className="grid gap-4 px-5 py-4">
+          {blocked ? (
+            <Alert variant="warning">
+              Plugin-cache skills are managed by plugin installation and cannot be uninstalled safely here.
+            </Alert>
+          ) : (
+            <Alert variant="destructive">
+              This removes the selected skill installation path from disk.
+            </Alert>
+          )}
+          <dl className="grid gap-2 text-sm">
+            <div className="grid grid-cols-[96px_minmax(0,1fr)] gap-3">
+              <dt className="text-zinc-500">Provider</dt>
+              <dd className="m-0 min-w-0 text-zinc-950">{skill.providerLabel}</dd>
+            </div>
+            <div className="grid grid-cols-[96px_minmax(0,1fr)] gap-3">
+              <dt className="text-zinc-500">Source</dt>
+              <dd className="m-0 min-w-0 text-zinc-950">{skill.sourceType}</dd>
+            </div>
+            <div className="grid grid-cols-[96px_minmax(0,1fr)] gap-3">
+              <dt className="text-zinc-500">Path</dt>
+              <dd className="m-0 min-w-0 break-all font-mono text-xs text-zinc-800">{skill.directory}</dd>
+            </div>
+          </dl>
+        </div>
+        <footer className="flex justify-end gap-2 border-t border-zinc-200 px-5 py-4">
+          <Button type="button" variant="outline" onClick={onCancel}>Cancel</Button>
+          {!blocked ? (
+            <Button
+              type="button"
+              className="border-red-600 bg-red-600 text-white hover:border-red-700 hover:bg-red-700"
+              onClick={onConfirm}
+            >
+              <Trash2 size={14} /> Uninstall
+            </Button>
+          ) : null}
+        </footer>
+      </section>
+    </div>
+  );
+}
+
+function UninstallProgress({
+  result,
+  skill,
+  steps,
+  working,
+  error,
+  onBack,
+}: {
+  result: SkillUninstallPayload | null;
+  skill: Skill | null;
+  steps: SkillUninstallStep[];
+  working: boolean;
+  error: string | null;
+  onBack: () => void;
+}) {
+  return (
+    <section className="grid gap-4 px-6 py-3">
+      <Button type="button" variant="outline" size="sm" className="w-fit" onClick={onBack}>
+        <ArrowLeft size={15} /> Catalog
+      </Button>
+      <div className="rounded-lg border border-zinc-200 bg-white p-5">
+        <div className="mb-5 flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <p className="m-0 text-xs font-semibold uppercase tracking-normal text-zinc-500">Uninstall</p>
+            <h3 className="m-0 mt-1 text-lg font-semibold leading-6 text-zinc-950">
+              {skill?.title ?? result?.skill.title ?? "Skill"}
+            </h3>
+          </div>
+          {working ? <Badge variant="outline"><Loader2 className="animate-spin" size={13} /> working</Badge> : null}
+          {result && !error ? <Badge variant="outline">removed</Badge> : null}
+        </div>
+        <ol className="grid gap-3">
+          {steps.map((step) => (
+            <li key={step.name} className="grid grid-cols-[28px_minmax(0,1fr)] items-center gap-3">
+              <span className={`grid h-7 w-7 place-items-center rounded-full border text-xs ${
+                step.status === "completed"
+                  ? "border-emerald-600 bg-emerald-50 text-emerald-700"
+                  : step.status === "failed"
+                    ? "border-red-600 bg-red-50 text-red-700"
+                    : step.status === "running"
+                      ? "border-blue-600 bg-blue-50 text-blue-700"
+                      : "border-zinc-200 bg-zinc-50 text-zinc-400"
+              }`}>
+                {step.status === "running" ? <Loader2 className="animate-spin" size={13} /> : null}
+                {step.status === "completed" ? <Check size={13} /> : null}
+                {step.status === "failed" ? <ShieldAlert size={13} /> : null}
+              </span>
+              <span className="text-sm font-medium text-zinc-950">{step.message}</span>
+            </li>
+          ))}
+        </ol>
+        {error ? <Alert className="mt-5" variant="destructive">{error}</Alert> : null}
+        {result?.removedPaths.length ? (
+          <div className="mt-5 rounded-md border border-zinc-200 bg-zinc-50 p-3">
+            <p className="m-0 mb-2 text-xs font-semibold uppercase tracking-normal text-zinc-500">Removed paths</p>
+            {result.removedPaths.map((path) => (
+              <p key={path} className="m-0 break-all font-mono text-xs text-zinc-800">{path}</p>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
 function App() {
   const [route, setRoute] = useState<Route>(() => routeFromLocation());
   const [payload, setPayload] = useState<SkillsPayload | null>(null);
@@ -358,6 +574,11 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [fileLoading, setFileLoading] = useState(false);
   const [copiedSelection, setCopiedSelection] = useState(false);
+  const [uninstallDialog, setUninstallDialog] = useState<"confirm" | "blocked" | null>(null);
+  const [uninstallSteps, setUninstallSteps] = useState<SkillUninstallStep[]>(initialUninstallSteps);
+  const [uninstallResult, setUninstallResult] = useState<SkillUninstallPayload | null>(null);
+  const [uninstallError, setUninstallError] = useState<string | null>(null);
+  const [uninstallWorking, setUninstallWorking] = useState(false);
 
   const loadSkills = async () => {
     setLoading(true);
@@ -394,7 +615,11 @@ function App() {
   };
 
   const navigate = (nextRoute: Route) => {
-    const nextPath = nextRoute.name === "catalog" ? "/" : skillRoute(nextRoute.ref);
+    const nextPath = nextRoute.name === "catalog"
+      ? "/"
+      : nextRoute.name === "uninstall"
+        ? uninstallRoute(nextRoute.ref)
+        : skillRoute(nextRoute.ref);
     window.history.pushState(null, "", nextPath);
     setRoute(nextRoute);
   };
@@ -430,6 +655,7 @@ function App() {
   const sourceTypes = unique(skills.map((skill) => skill.sourceType));
   const warnings = payload?.warnings ?? [];
   const activeFilterCount = [provider !== "all", pluginId !== "all", sourceType !== "all"].filter(Boolean).length;
+  const filtersDisabled = route.name !== "catalog";
 
   const countMatching = (nextFilter: Partial<Pick<Skill, "provider" | "pluginId" | "sourceType">>) =>
     skills.filter((skill) =>
@@ -458,7 +684,9 @@ function App() {
   const totalPages = Math.max(1, Math.ceil(filteredSkills.length / PAGE_SIZE));
   const currentPage = Math.min(page, totalPages);
   const visibleSkills = filteredSkills.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
-  const detailSkill = filePayload?.skill ?? skills.find((skill) => route.name === "skill" && skill.ref === route.ref) ?? null;
+  const detailSkill = filePayload?.skill ??
+    skills.find((skill) => (route.name === "skill" || route.name === "uninstall") && skill.ref === route.ref) ??
+    null;
 
   const copy = async (value: string) => {
     await navigator.clipboard?.writeText(value);
@@ -472,6 +700,61 @@ function App() {
     await copy(content);
     setCopiedSelection(true);
     window.setTimeout(() => setCopiedSelection(false), 1200);
+  };
+
+  const openUninstall = (skill: Skill) => {
+    setUninstallDialog(skill.sourceType === "plugin" ? "blocked" : "confirm");
+  };
+
+  const confirmUninstall = async (skill: Skill) => {
+    setUninstallDialog(null);
+    setUninstallResult(null);
+    setUninstallError(null);
+    setUninstallSteps(initialUninstallSteps());
+    setUninstallWorking(true);
+    navigate({ name: "uninstall", ref: skill.ref });
+
+    try {
+      const request = (async () => {
+        const response = await fetch(`/api/v1/skills/${encodeURIComponent(skill.ref)}/uninstall`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ confirmRef: skill.ref }),
+        });
+        const nextPayload = await response.json() as SkillUninstallPayload | { warnings?: SkillWarning[] };
+        if (!response.ok) {
+          const warning = nextPayload.warnings?.[0];
+          throw new Error(warning?.message ?? `Uninstall returned ${response.status}`);
+        }
+        return nextPayload as SkillUninstallPayload;
+      })();
+
+      const [requestOutcome] = await Promise.allSettled([
+        request,
+        playUninstallProgress(setUninstallSteps),
+      ]);
+
+      if (requestOutcome.status === "rejected") {
+        throw requestOutcome.reason;
+      }
+
+      const result = requestOutcome.value;
+      setUninstallResult(result);
+      setUninstallSteps(uninstallStepsAt(UNINSTALL_STEP_NAMES.length));
+      await loadSkills();
+    } catch (nextError) {
+      setUninstallError(nextError instanceof Error ? nextError.message : String(nextError));
+      setUninstallSteps((current) => {
+        const runningIndex = current.findIndex((step) => step.status === "running");
+        const completedCount = current.filter((step) => step.status === "completed").length;
+        const failedIndex = runningIndex === -1
+          ? Math.min(completedCount, UNINSTALL_STEP_NAMES.length - 1)
+          : runningIndex;
+        return uninstallStepsAt(failedIndex, failedIndex);
+      });
+    } finally {
+      setUninstallWorking(false);
+    }
   };
 
   return (
@@ -498,14 +781,29 @@ function App() {
           <div className="sidebar-section-header">
             <p className="sidebar-label">Providers</p>
             {activeFilterCount > 0 ? (
-              <button type="button" className="sidebar-clear" onClick={clearFilters}>Clear</button>
+              <button
+                type="button"
+                className="sidebar-clear"
+                disabled={filtersDisabled}
+                title={filtersDisabled ? "Filters are available in catalog view" : undefined}
+                onClick={clearFilters}
+              >
+                Clear
+              </button>
             ) : null}
           </div>
-          <FilterButton active={provider === "all"} label="All providers" count={skills.length} onClick={() => setProvider("all")} />
+          <FilterButton
+            active={provider === "all"}
+            disabled={filtersDisabled}
+            label="All providers"
+            count={skills.length}
+            onClick={() => setProvider("all")}
+          />
           {providers.map((value) => (
             <FilterButton
               key={value}
               active={provider === value}
+              disabled={filtersDisabled}
               label={value}
               count={countMatching({ provider: value })}
               onClick={() => setProvider(value)}
@@ -515,11 +813,18 @@ function App() {
 
         <section className="sidebar-section" aria-label="Source groups">
           <p className="sidebar-label">Sources</p>
-          <FilterButton active={sourceType === "all"} label="All sources" count={skills.length} onClick={() => setSourceType("all")} />
+          <FilterButton
+            active={sourceType === "all"}
+            disabled={filtersDisabled}
+            label="All sources"
+            count={skills.length}
+            onClick={() => setSourceType("all")}
+          />
           {sourceTypes.map((value) => (
             <FilterButton
               key={value}
               active={sourceType === value}
+              disabled={filtersDisabled}
               label={value}
               count={countMatching({ sourceType: value })}
               onClick={() => setSourceType(value)}
@@ -530,11 +835,18 @@ function App() {
         {plugins.length > 0 ? (
           <section className="sidebar-section sidebar-section-scroll" aria-label="Plugins">
             <p className="sidebar-label">Plugins</p>
-            <FilterButton active={pluginId === "all"} label="All plugins" count={skills.length} onClick={() => setPluginId("all")} />
+            <FilterButton
+              active={pluginId === "all"}
+              disabled={filtersDisabled}
+              label="All plugins"
+              count={skills.length}
+              onClick={() => setPluginId("all")}
+            />
             {plugins.map((value) => (
               <FilterButton
                 key={value}
                 active={pluginId === value}
+                disabled={filtersDisabled}
                 label={value}
                 count={countMatching({ pluginId: value })}
                 onClick={() => setPluginId(value)}
@@ -548,8 +860,16 @@ function App() {
         <header className="topbar">
           <div className="topbar-inner">
             <div>
-              <p className="eyebrow">{route.name === "catalog" ? "Catalog" : "Skill Preview"}</p>
-              <h2>{route.name === "catalog" ? "Installed skills" : detailSkill?.title ?? "Loading skill..."}</h2>
+              <p className="eyebrow">
+                {route.name === "catalog" ? "Catalog" : route.name === "uninstall" ? "Uninstall" : "Skill Preview"}
+              </p>
+              <h2>
+                {route.name === "catalog"
+                  ? "Installed skills"
+                  : route.name === "uninstall"
+                    ? "Uninstall skill"
+                    : detailSkill?.title ?? "Loading skill..."}
+              </h2>
             </div>
             <div className="status-row" aria-label="Catalog status">
               <Badge variant="outline">local only</Badge>
@@ -656,6 +976,15 @@ function App() {
             ) : null}
           </section>
         </>
+      ) : route.name === "uninstall" ? (
+        <UninstallProgress
+          result={uninstallResult}
+          skill={detailSkill}
+          steps={uninstallSteps}
+          working={uninstallWorking}
+          error={uninstallError}
+          onBack={() => navigate({ name: "catalog" })}
+        />
       ) : (
         <section className="detail-shell">
           <Button type="button" variant="outline" size="sm" className="back-button" onClick={() => navigate({ name: "catalog" })}>
@@ -673,6 +1002,15 @@ function App() {
                 {detailSkill.pluginId ? <Badge variant="outline">{detailSkill.pluginId}</Badge> : null}
                 <Button variant="outline" size="sm" type="button" onClick={() => copy(detailSkill.ref)}><Copy size={14} /> ref</Button>
                 <Button variant="outline" size="sm" type="button" onClick={() => copy(detailSkill.path)}><Copy size={14} /> path</Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  type="button"
+                  className="border-red-200 text-red-700 hover:border-red-300 hover:bg-red-50"
+                  onClick={() => openUninstall(detailSkill)}
+                >
+                  <Trash2 size={14} /> Uninstall
+                </Button>
               </div>
             ) : null}
             {detailSkill ? <p className="detail-path">{detailSkill.relativePath}</p> : null}
@@ -747,6 +1085,14 @@ function App() {
         </section>
       )}
       </section>
+      {uninstallDialog && detailSkill ? (
+        <UninstallDialog
+          mode={uninstallDialog}
+          skill={detailSkill}
+          onCancel={() => setUninstallDialog(null)}
+          onConfirm={() => void confirmUninstall(detailSkill)}
+        />
+      ) : null}
     </main>
   );
 }

@@ -9,7 +9,8 @@ export type WarningCode =
   | "InvalidProviderConfig"
   | "ServerStartError"
   | "PreviewReadError"
-  | "PreviewTooLarge";
+  | "PreviewTooLarge"
+  | "SkillUninstallError";
 
 export type SkillWarning = {
   code: WarningCode;
@@ -36,6 +37,23 @@ export type NormalizedSkill = {
   path: string;
   directory: string;
   metadata: Record<string, MetadataValue>;
+};
+
+export type SkillUninstallStepName = "locating repo" | "removing" | "checking" | "removed";
+
+export type SkillUninstallStep = {
+  name: SkillUninstallStepName;
+  status: "pending" | "running" | "completed" | "failed";
+  message: string;
+};
+
+export type SkillUninstallResult = {
+  apiVersion: 1;
+  skill: NormalizedSkill;
+  steps: SkillUninstallStep[];
+  removedPaths: string[];
+  lockUpdated: boolean;
+  warnings: SkillWarning[];
 };
 
 export type SkillsPayload = {

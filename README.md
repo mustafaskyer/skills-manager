@@ -4,7 +4,7 @@ Visualize, search, and inspect the agent skills installed on your machine.
 
 Codex Skills Manager gives you one local dashboard for the skills side of Codex: what is installed, where each skill came from, what it does, and what files belong to it. It is built for the moment when you know you added useful skills, but no longer remember their names, providers, plugin bundles, or exact paths.
 
-The current app focuses on cataloging, filtering, previewing, and indexing skills. It is structured to become the control surface for add, remove, enable, and disable workflows without pushing provider-specific path rules into the UI.
+The current app focuses on cataloging, filtering, previewing, uninstalling user skills, and indexing skills. It is structured to become the control surface for add, enable, and disable workflows without pushing provider-specific path rules into the UI.
 
 ## Screenshots
 
@@ -12,12 +12,15 @@ The current app focuses on cataloging, filtering, previewing, and indexing skill
 
 ![Skill preview view](screenshots/Screenshot%202026-06-13%20at%2010.28.19%E2%80%AFPM.png)
 
+![Uninstall progress view](screenshots/uninstall.png)
+
 ## What It Does
 
 - Discovers public Codex skills from `~/.codex/skills`, `~/.agents/skills`, and `~/.codex/plugins/cache`.
 - Keeps system skills under `~/.codex/skills/.system` excluded by default.
 - Shows installed skills in a dense dashboard with search, provider filters, source filters, plugin filters, counts, and warnings.
 - Opens a skill detail page with metadata, copyable refs and paths, a file tree, markdown preview, text preview, Mermaid, code, math, and CJK rendering.
+- Uninstalls user-managed Codex skills from detail pages after explicit confirmation, with plugin-cache skills blocked to avoid corrupting managed plugin bundles.
 - Writes a v1-compatible JSON skill index for older integrations.
 - Watches skill roots and rewrites the JSON index when `SKILL.md` files change.
 - Keeps provider logic isolated so future providers can be added without changing catalog, server, or UI assumptions.
@@ -67,6 +70,12 @@ Use a different port when needed:
 bun run bin/skillsmanager.ts dev --port 3738
 ```
 
+## Uninstalling Skills
+
+Open a user-managed skill from the dashboard, click **Uninstall**, and confirm the removal. The app removes the discovered installation directory, shows the uninstall progress, lists removed paths, and refreshes the catalog.
+
+Plugin-cache skills are intentionally blocked because they are managed by plugin installation and removing them directly can corrupt managed bundles.
+
 ## CLI
 
 Run the dashboard:
@@ -86,6 +95,16 @@ Watch skill roots and keep the JSON index updated:
 ```bash
 skillsmanager watch --provider codex --root ./skills --output ~/.skills-manager/skills.json
 ```
+
+Uninstall a user skill by provider-aware ref, legacy ref, or exact unique name:
+
+```bash
+skillsmanager uninstall codex:agents:agent-browser --provider codex --root ~/.agents/skills
+skillsmanager uninstall agents:agent-browser --yes
+skillsmanager uninstall agent-browser --yes
+```
+
+Uninstall refuses plugin-cache skills because they are managed by plugin installation. Use an exact ref when more than one installed skill has the same `name`.
 
 The server binds to `127.0.0.1` by default. Passing `--host 0.0.0.0` is an explicit opt-in.
 
@@ -179,6 +198,18 @@ Returns the normalized skill entry and `SKILL.md` markdown preview content. Prev
 ### `GET /api/v1/skills/:encodedRef/files?path=SKILL.md`
 
 Returns a safe file preview from inside the selected skill directory, plus the file tree for that skill.
+
+### `POST /api/v1/skills/:encodedRef/uninstall`
+
+Uninstalls a user-managed skill from its discovered installation directory. The request must confirm the provider-aware ref:
+
+```json
+{
+  "confirmRef": "codex:agents:agent-browser"
+}
+```
+
+Successful responses include progress steps, removed paths, and whether `~/.agents/.skill-lock.json` was updated. Plugin-cache skills and unsafe paths return `SkillUninstallError` warnings and are not removed.
 
 Warnings use this shape:
 

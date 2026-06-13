@@ -1,6 +1,13 @@
 import { Context, Effect, Layer } from "effect";
 
-import { SkillParseError, type NormalizedSkill, type SkillWarning } from "../../domain";
+import {
+  SkillParseError,
+  type NormalizedSkill,
+  type SkillUninstallResult,
+  type SkillUninstallStep,
+  type SkillUninstallStepName,
+  type SkillWarning,
+} from "../../domain";
 import { firstHeading, firstParagraph, parseFrontmatter } from "../../frontmatter";
 import {
   basename,
@@ -90,6 +97,138 @@ function legacyRefForEntry(entry: ProviderSkillEntry): string {
     return `plugin:${entry.pluginId}:${skillName}`;
   }
   return `${entry.sourceType}:${skillName}`;
+}
+
+function uninstallSteps(
+  activeName?: SkillUninstallStepName,
+  failedName?: SkillUninstallStepName,
+  completedNames: readonly SkillUninstallStepName[] = [],
+): SkillUninstallStep[] {
+  const names: SkillUninstallStepName[] = ["locating repo", "removing", "checking", "removed"];
+  return names.map((name) => ({
+    name,
+    status: failedName === name
+      ? "failed"
+      : completedNames.includes(name)
+        ? "completed"
+        : activeName === name
+          ? "running"
+          : "pending",
+    message: name,
+  }));
+}
+
+function uninstallWarning(skill: NormalizedSkill, message: string): SkillWarning {
+  return {
+    code: "SkillUninstallError",
+    provider: skill.provider,
+    ref: skill.ref,
+    path: skill.directory,
+    message,
+  };
+}
+
+function skillLockPath(homeDir: string): string {
+  return joinPath(homeDir, ".agents", ".skill-lock.json");
+}
+
+async function removeSkillFromLock(homeDir: string, skillName: string): Promise<boolean> {
+  const lockPath = skillLockPath(homeDir);
+  const file = Bun.file(lockPath);
+  if (!(await file.exists())) return false;
+
+  const raw = await file.text();
+  const parsed = JSON.parse(raw) as {
+    skills?: Record<string, unknown>;
+  };
+  if (!parsed.skills || !(skillName in parsed.skills)) return false;
+
+  delete parsed.skills[skillName];
+  await Bun.write(lockPath, `${JSON.stringify(parsed, null, 2)}\n`);
+  return true;
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  return Bun.file(path).exists();
+}
+
+function matchingSourceRoot(skill: NormalizedSkill, context: ProviderContext): string | null {
+  const roots = (context.roots && context.roots.length > 0
+    ? context.roots
+    : defaultCodexRoots(context.homeDir)).map(normalizePath);
+  const sourceRoot = skill.sourceRoot ? normalizePath(skill.sourceRoot) : null;
+  if (!sourceRoot) return null;
+  if (!roots.includes(sourceRoot)) return null;
+
+  const relative = relativePath(sourceRoot, skill.directory);
+  if (!isRelativeInside(relative)) return null;
+  if (normalizePath(skill.directory) === sourceRoot) return null;
+  return sourceRoot;
+}
+
+export async function uninstallCodexSkill(
+  skill: NormalizedSkill,
+  context: ProviderContext,
+): Promise<SkillUninstallResult> {
+  const completed: SkillUninstallStepName[] = [];
+
+  const fail = (step: SkillUninstallStepName, message: string): SkillUninstallResult => ({
+    apiVersion: 1,
+    skill,
+    steps: uninstallSteps(undefined, step, completed),
+    removedPaths: [],
+    lockUpdated: false,
+    warnings: [uninstallWarning(skill, message)],
+  });
+
+  if (skill.provider !== "codex") {
+    return fail("locating repo", `Provider cannot uninstall this skill: ${skill.provider}`);
+  }
+
+  if (skill.sourceType === "plugin") {
+    return fail(
+      "locating repo",
+      "Plugin-cache skills are managed by plugin installation and cannot be uninstalled safely here.",
+    );
+  }
+
+  const sourceRoot = matchingSourceRoot(skill, context);
+  if (!sourceRoot) {
+    return fail("locating repo", "Skill directory is not inside an enabled source root.");
+  }
+
+  const skillFile = joinPath(skill.directory, SKILL_FILE);
+  if (!(await fileExists(skillFile))) {
+    return fail("locating repo", "Skill directory does not contain SKILL.md.");
+  }
+
+  completed.push("locating repo");
+
+  try {
+    await Bun.$`rm -rf ${skill.directory}`.quiet();
+  } catch (error) {
+    return fail("removing", error instanceof Error ? error.message : String(error));
+  }
+
+  completed.push("removing");
+
+  if (await fileExists(skillFile) || await fileExists(skill.directory)) {
+    return fail("checking", "Skill directory still exists after removal.");
+  }
+
+  completed.push("checking");
+  completed.push("removed");
+
+  const lockUpdated = await removeSkillFromLock(context.homeDir, skill.name).catch(() => false);
+
+  return {
+    apiVersion: 1,
+    skill,
+    steps: uninstallSteps(undefined, undefined, completed),
+    removedPaths: [skill.directory],
+    lockUpdated,
+    warnings: [],
+  };
 }
 
 export function codexSkillFromMarkdown(
@@ -192,6 +331,7 @@ export const CodexProvider: SkillProvider = {
           message: cause instanceof Error ? cause.message : String(cause),
         }),
     }),
+  uninstall: (skill, context) => Effect.promise(() => uninstallCodexSkill(skill, context)),
 };
 
 export class CodexProviderService extends Context.Service<CodexProviderService, SkillProvider>()(

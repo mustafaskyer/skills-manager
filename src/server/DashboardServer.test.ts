@@ -235,3 +235,144 @@ description: Browser automation.
     await server.stop();
   }
 });
+
+test("uninstall endpoint removes user skills and cleans matching lock entries", async () => {
+  const homeDir = joinPath(tempDir, "home");
+  const root = joinPath(homeDir, ".agents", "skills");
+  const skillPath = joinPath(root, "agent-browser", "SKILL.md");
+  const lockPath = joinPath(homeDir, ".agents", ".skill-lock.json");
+  await writeSkill(
+    skillPath,
+    `---
+name: agent-browser
+description: Browser automation.
+---
+
+# Browser Automation
+`,
+  );
+  await Bun.write(lockPath, `${JSON.stringify({
+    version: 3,
+    skills: {
+      "agent-browser": { source: "owner/repo" },
+      other: { source: "owner/repo" },
+    },
+  }, null, 2)}\n`);
+
+  const port = await freePort();
+  const server = await startDashboardServer({
+    host: "127.0.0.1",
+    port,
+    homeDir,
+    providers: ["codex"],
+    rootsByProvider: { codex: [root] },
+  });
+
+  try {
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const response = await fetch(
+      `${baseUrl}/api/v1/skills/${encodeURIComponent("codex:agents:agent-browser")}/uninstall`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ confirmRef: "codex:agents:agent-browser" }),
+      },
+    );
+    const body = await response.json();
+    const skills = await fetch(`${baseUrl}/api/v1/skills`).then((nextResponse) => nextResponse.json());
+    const lock = await Bun.file(lockPath).json();
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      apiVersion: 1,
+      lockUpdated: true,
+      removedPaths: [joinPath(root, "agent-browser")],
+    });
+    expect(body.steps.map((step: { status: string }) => step.status)).toEqual([
+      "completed",
+      "completed",
+      "completed",
+      "completed",
+    ]);
+    expect(await Bun.file(skillPath).exists()).toBe(false);
+    expect(skills.count).toBe(0);
+    expect(lock.skills).not.toHaveProperty("agent-browser");
+    expect(lock.skills).toHaveProperty("other");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("uninstall endpoint rejects confirmation mismatches and plugin-cache skills", async () => {
+  const homeDir = joinPath(tempDir, "home");
+  const agentsRoot = joinPath(homeDir, ".agents", "skills");
+  const pluginRoot = joinPath(homeDir, ".codex", "plugins", "cache");
+  const userSkillPath = joinPath(agentsRoot, "agent-browser", "SKILL.md");
+  const pluginSkillPath = joinPath(pluginRoot, "bundle", "1.0.0", "skills", "github", "SKILL.md");
+  await writeSkill(
+    userSkillPath,
+    `---
+name: agent-browser
+description: Browser automation.
+---
+
+# Browser Automation
+`,
+  );
+  await writeSkill(
+    pluginSkillPath,
+    `---
+name: github
+description: GitHub tools.
+---
+
+# GitHub
+`,
+  );
+
+  const port = await freePort();
+  const server = await startDashboardServer({
+    host: "127.0.0.1",
+    port,
+    homeDir,
+    providers: ["codex"],
+    rootsByProvider: { codex: [agentsRoot, pluginRoot] },
+  });
+
+  try {
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const mismatch = await fetch(
+      `${baseUrl}/api/v1/skills/${encodeURIComponent("codex:agents:agent-browser")}/uninstall`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ confirmRef: "agents:agent-browser" }),
+      },
+    );
+    const mismatchBody = await mismatch.json();
+    const plugin = await fetch(
+      `${baseUrl}/api/v1/skills/${encodeURIComponent("codex:plugin:bundle/1.0.0:github")}/uninstall`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ confirmRef: "codex:plugin:bundle/1.0.0:github" }),
+      },
+    );
+    const pluginBody = await plugin.json();
+
+    expect(mismatch.status).toBe(400);
+    expect(mismatchBody.warnings[0]).toMatchObject({
+      code: "SkillUninstallError",
+      message: "Confirmation ref must match the provider-aware skill ref.",
+    });
+    expect(plugin.status).toBe(400);
+    expect(pluginBody.warnings[0]).toMatchObject({
+      code: "SkillUninstallError",
+      message: "Plugin-cache skills are managed by plugin installation and cannot be uninstalled safely here.",
+    });
+    expect(await Bun.file(userSkillPath).exists()).toBe(true);
+    expect(await Bun.file(pluginSkillPath).exists()).toBe(true);
+  } finally {
+    await server.stop();
+  }
+});
